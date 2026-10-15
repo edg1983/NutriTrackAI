@@ -1,0 +1,55 @@
+# Built application & release artifacts
+*.apk
+*.aar
+*.apks
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java & Kotlin compiled class files
+*.class
+
+# Generated build directories & release outputs
+build/
+/*/build/
+bin/
+gen/
+out/
+release/
+**/release/
+
+# Kotlin cache directory
+.kotlin/
+
+# Gradle directory & cache
+.gradle/
+gradle-app.setting
+
+# Local configuration file (SDK path, local API keys)
+local.properties
+
+# Log Files
+*.log
+
+# Android Studio / IntelliJ IDEA / Eclipse
+.idea/
+*.iml
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Keystore files & signing keys
+*.jks
+*.keystore
+*.pepk
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
