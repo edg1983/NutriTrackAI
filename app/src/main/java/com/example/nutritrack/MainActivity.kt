@@ -166,10 +166,18 @@ fun NutriTrackApp(
 
                 1 -> LogMealScreen(
                     apiKey = appState.customApiKey,
+                    previousMeals = appState.meals,
+                    customBarcodes = appState.customBarcodes,
                     geminiService = geminiService,
                     openFoodFactsService = openFoodFactsService,
                     onAiEstimateReady = { estimate ->
                         pendingReviewMeal = estimate
+                    },
+                    onSaveCustomBarcode = { newCustomBarcode ->
+                        updateState {
+                            it.copy(customBarcodes = it.customBarcodes + newCustomBarcode)
+                        }
+                        Toast.makeText(context, "Saved '${newCustomBarcode.name}' to local barcode database!", Toast.LENGTH_SHORT).show()
                     },
                     onError = { msg ->
                         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
@@ -455,9 +463,12 @@ fun MacroPill(label: String, value: String, color: Color) {
 @Composable
 fun LogMealScreen(
     apiKey: String,
+    previousMeals: List<MealEntry>,
+    customBarcodes: List<CustomBarcodeItem>,
     geminiService: GeminiNutritionService,
     openFoodFactsService: OpenFoodFactsService,
     onAiEstimateReady: (AiMealEstimate) -> Unit,
+    onSaveCustomBarcode: (CustomBarcodeItem) -> Unit,
     onError: (String) -> Unit
 ) {
     val context = LocalContext.current
@@ -473,6 +484,7 @@ fun LogMealScreen(
     var lastScannedBarcode by remember { mutableStateOf<String?>(null) }
 
     var isAnalyzing by remember { mutableStateOf(false) }
+    var pendingCustomBarcodeModal by remember { mutableStateOf<String?>(null) }
 
     val barcodeScanner = remember(context) {
         val options = GmsBarcodeScannerOptions.Builder()
@@ -489,15 +501,30 @@ fun LogMealScreen(
     }
 
     fun fetchBarcodeNutrition(barcodeValue: String) {
+        val cleanBarcode = barcodeValue.trim()
+        if (cleanBarcode.isBlank()) {
+            onError("Please enter or scan a valid barcode.")
+            return
+        }
         val grams = consumedGramsInput.toFloatOrNull()?.coerceIn(1f, 5000f) ?: 100f
+
+        // 1. Search local custom barcode database first
+        val localMatch = customBarcodes.find { it.barcode.equals(cleanBarcode, ignoreCase = true) }
+        if (localMatch != null) {
+            onAiEstimateReady(localMatch.toAiMealEstimate(grams))
+            return
+        }
+
+        // 2. Search OpenFoodFacts
         isAnalyzing = true
         scope.launch {
-            val result = openFoodFactsService.lookupBarcode(barcodeValue, grams)
+            val result = openFoodFactsService.lookupBarcode(cleanBarcode, grams)
             isAnalyzing = false
             result.onSuccess { estimate ->
                 onAiEstimateReady(estimate)
-            }.onFailure { err ->
-                onError(err.localizedMessage ?: "Failed to look up barcode $barcodeValue")
+            }.onFailure {
+                // Not found in OpenFoodFacts -> Prompt user to create a custom entry!
+                pendingCustomBarcodeModal = cleanBarcode
             }
         }
     }
@@ -522,6 +549,206 @@ fun LogMealScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
+        // Section 0: Quick Log from History & Search
+        Card(
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+            )
+        ) {
+            Column(modifier = Modifier.padding(18.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.History,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        "Quick Log from History",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "Quickly re-log recent meals or search past entries to adjust quantity and log:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+                var searchQuery by remember { mutableStateOf("") }
+
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear")
+                            }
+                        }
+                    },
+                    label = { Text("Search previous meals...") },
+                    placeholder = { Text("e.g. Oats, Chicken Salad, Pasta...") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                val filteredMeals = remember(previousMeals, searchQuery) {
+                    val sorted = previousMeals.sortedByDescending { it.timestamp }
+                    val distinct = mutableListOf<MealEntry>()
+                    val seen = mutableSetOf<String>()
+                    for (m in sorted) {
+                        val key = m.name.trim().lowercase()
+                        if (seen.add(key)) {
+                            distinct.add(m)
+                        }
+                    }
+                    if (searchQuery.isBlank()) {
+                        distinct.take(10) // Top 10 most recent distinct meals
+                    } else {
+                        distinct.filter {
+                            it.name.contains(searchQuery, ignoreCase = true) ||
+                            it.ingredients.any { ing -> ing.contains(searchQuery, ignoreCase = true) }
+                        }
+                    }
+                }
+
+                if (previousMeals.isEmpty()) {
+                    Text(
+                        "No previous meals logged yet. Log a meal below to build your history!",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 8.dp)
+                    )
+                } else if (filteredMeals.isEmpty()) {
+                    Text(
+                        "No previous meals found matching '$searchQuery'.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(vertical = 8.dp)
+                    )
+                } else {
+                    if (searchQuery.isBlank()) {
+                        Text(
+                            "Recent Meals (tap to re-log):",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        androidx.compose.foundation.lazy.LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            contentPadding = PaddingValues(vertical = 4.dp)
+                        ) {
+                            items(filteredMeals) { meal ->
+                                Card(
+                                    onClick = {
+                                        onAiEstimateReady(
+                                            AiMealEstimate(
+                                                mealName = meal.name,
+                                                estimatedQuantity = meal.quantityDescription,
+                                                ingredients = meal.ingredients.ifEmpty { listOf(meal.name) },
+                                                calories = meal.calories,
+                                                proteinGrams = meal.proteinGrams,
+                                                carbsGrams = meal.carbsGrams,
+                                                fatGrams = meal.fatGrams,
+                                                fiberGrams = meal.fiberGrams,
+                                                healthTip = "Re-logged from history (${meal.quantityDescription}). Adjust quantity if needed."
+                                            )
+                                        )
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                                    )
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text(
+                                            meal.name,
+                                            fontWeight = FontWeight.Bold,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            maxLines = 1
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            "${meal.calories} kcal • ${meal.quantityDescription}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            "P: ${meal.proteinGrams.toInt()}g | C: ${meal.carbsGrams.toInt()}g | F: ${meal.fatGrams.toInt()}g",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            filteredMeals.take(5).forEach { meal ->
+                                Card(
+                                    onClick = {
+                                        onAiEstimateReady(
+                                            AiMealEstimate(
+                                                mealName = meal.name,
+                                                estimatedQuantity = meal.quantityDescription,
+                                                ingredients = meal.ingredients.ifEmpty { listOf(meal.name) },
+                                                calories = meal.calories,
+                                                proteinGrams = meal.proteinGrams,
+                                                carbsGrams = meal.carbsGrams,
+                                                fatGrams = meal.fatGrams,
+                                                fiberGrams = meal.fiberGrams,
+                                                healthTip = "Re-logged from history (${meal.quantityDescription}). Adjust quantity if needed."
+                                            )
+                                        )
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                                    )
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                meal.name,
+                                                fontWeight = FontWeight.Bold,
+                                                style = MaterialTheme.typography.bodyMedium
+                                            )
+                                            Text(
+                                                "${meal.calories} kcal • ${meal.quantityDescription}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        Icon(
+                                            Icons.Default.Add,
+                                            contentDescription = "Log Meal",
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Method 1: Manual Text + Quantity Input with LLM
         Card(shape = RoundedCornerShape(20.dp)) {
             Column(modifier = Modifier.padding(18.dp)) {
@@ -649,21 +876,21 @@ fun LogMealScreen(
             }
         }
 
-        // Method 3: ML Kit Barcode Scanner + OpenFoodFacts Lookup
+        // Method 3: ML Kit Barcode Scanner + OpenFoodFacts / Local DB Lookup
         Card(shape = RoundedCornerShape(20.dp)) {
             Column(modifier = Modifier.padding(18.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.QrCodeScanner, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        "Method 3: Scan Barcode (OpenFoodFacts)",
+                        "Method 3: Scan Barcode (OpenFoodFacts & Local DB)",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    "Scan any packaged food EAN/UPC barcode with ML Kit to fetch verified nutrition per 100g and scale to your portion.",
+                    "Scan any food barcode. Searches OpenFoodFacts and your local custom database, scaling 100g values to your portion.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -735,6 +962,20 @@ fun LogMealScreen(
                 }
             }
         }
+    }
+
+    pendingCustomBarcodeModal?.let { unknownBarcode ->
+        CreateCustomBarcodeDialog(
+            barcode = unknownBarcode,
+            defaultGrams = consumedGramsInput.toFloatOrNull()?.coerceIn(1f, 5000f) ?: 100f,
+            onDismiss = { pendingCustomBarcodeModal = null },
+            onSave = { newItem ->
+                onSaveCustomBarcode(newItem)
+                val grams = consumedGramsInput.toFloatOrNull()?.coerceIn(1f, 5000f) ?: 100f
+                onAiEstimateReady(newItem.toAiMealEstimate(grams))
+                pendingCustomBarcodeModal = null
+            }
+        )
     }
 }
 
@@ -1082,6 +1323,165 @@ fun GoalAndApiSettingsDialog(
                 }
             ) {
                 Text("Save Settings")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+fun CreateCustomBarcodeDialog(
+    barcode: String,
+    defaultGrams: Float,
+    onDismiss: () -> Unit,
+    onSave: (CustomBarcodeItem) -> Unit
+) {
+    var title by remember { mutableStateOf("") }
+    var brand by remember { mutableStateOf("") }
+    var caloriesStr by remember { mutableStateOf("") }
+    var proteinStr by remember { mutableStateOf("") }
+    var carbsStr by remember { mutableStateOf("") }
+    var fatStr by remember { mutableStateOf("") }
+    var fiberStr by remember { mutableStateOf("") }
+
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column {
+                Text("Unknown Barcode: $barcode", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Product not found in OpenFoodFacts. Enter 100g values below (will automatically scale to your ${defaultGrams.toInt()}g portion):",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Food Title / Name *") },
+                    placeholder = { Text("e.g. Protein Bar") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                OutlinedTextField(
+                    value = brand,
+                    onValueChange = { brand = it },
+                    label = { Text("Brand Name (Optional)") },
+                    placeholder = { Text("e.g. FitBrand") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                Text(
+                    "Nutritional Values per 100g:",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = caloriesStr,
+                        onValueChange = { caloriesStr = it },
+                        label = { Text("Calories (kcal) *") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = proteinStr,
+                        onValueChange = { proteinStr = it },
+                        label = { Text("Protein (g) *") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = carbsStr,
+                        onValueChange = { carbsStr = it },
+                        label = { Text("Carbs (g) *") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = fatStr,
+                        onValueChange = { fatStr = it },
+                        label = { Text("Fat (g) *") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.weight(1f),
+                        singleLine = true
+                    )
+                }
+
+                OutlinedTextField(
+                    value = fiberStr,
+                    onValueChange = { fiberStr = it },
+                    label = { Text("Fiber (g) (Optional)") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+
+                errorMessage?.let { err ->
+                    Text(
+                        err,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (title.isBlank()) {
+                        errorMessage = "Please enter a food title."
+                        return@Button
+                    }
+                    val cal = caloriesStr.toIntOrNull()
+                    val prot = proteinStr.toFloatOrNull()
+                    val carbs = carbsStr.toFloatOrNull()
+                    val fat = fatStr.toFloatOrNull()
+                    val fiber = fiberStr.toFloatOrNull() ?: 0f
+
+                    if (cal == null || cal < 0 || prot == null || prot < 0f || carbs == null || carbs < 0f || fat == null || fat < 0f) {
+                        errorMessage = "Please enter valid numbers for 100g calories and main macros."
+                        return@Button
+                    }
+
+                    val newItem = CustomBarcodeItem(
+                        barcode = barcode,
+                        name = title.trim(),
+                        brand = brand.trim(),
+                        caloriesPer100g = cal,
+                        proteinPer100g = prot,
+                        carbsPer100g = carbs,
+                        fatPer100g = fat,
+                        fiberPer100g = fiber
+                    )
+                    onSave(newItem)
+                }
+            ) {
+                Text("Save & Log")
             }
         },
         dismissButton = {

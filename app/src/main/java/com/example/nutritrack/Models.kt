@@ -27,12 +27,42 @@ data class DailyWaterLog(
 )
 
 @Serializable
+data class CustomBarcodeItem(
+    val barcode: String,
+    val name: String,
+    val caloriesPer100g: Int,
+    val proteinPer100g: Float,
+    val carbsPer100g: Float,
+    val fatPer100g: Float,
+    val fiberPer100g: Float = 0f,
+    val brand: String = "",
+    val timestamp: Long = System.currentTimeMillis()
+) {
+    fun toAiMealEstimate(consumedGrams: Float = 100f): AiMealEstimate {
+        val scaleFactor = (consumedGrams / 100f).coerceAtLeast(0.01f)
+        val fullName = if (brand.isNotBlank()) "$name ($brand)" else name
+        return AiMealEstimate(
+            mealName = fullName,
+            estimatedQuantity = "${consumedGrams.toInt()}g (Local Barcode $barcode)",
+            ingredients = listOf("Custom Barcode Entry ($barcode)"),
+            calories = kotlin.math.round((caloriesPer100g * scaleFactor)).toInt(),
+            proteinGrams = kotlin.math.round((proteinPer100g * scaleFactor * 10f)) / 10f,
+            carbsGrams = kotlin.math.round((carbsPer100g * scaleFactor * 10f)) / 10f,
+            fatGrams = kotlin.math.round((fatPer100g * scaleFactor * 10f)) / 10f,
+            fiberGrams = kotlin.math.round((fiberPer100g * scaleFactor * 10f)) / 10f,
+            healthTip = "Loaded from local custom barcode database ($barcode)."
+        )
+    }
+}
+
+@Serializable
 data class AppStateData(
     val dailyCalorieGoal: Int = 2000,
     val dailyWaterGoalMl: Int = 2500,
     val meals: List<MealEntry> = emptyList(),
     val waterLogs: Map<String, Int> = emptyMap(),
-    val customApiKey: String = ""
+    val customApiKey: String = "",
+    val customBarcodes: List<CustomBarcodeItem> = emptyList()
 )
 
 data class NutrientSummary(
