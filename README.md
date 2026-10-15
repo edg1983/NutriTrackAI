@@ -11,8 +11,8 @@ A complete, production-ready native Android application written in **Kotlin** an
 6. **7-Day Weekly Report & Healthy Score (0–100):** Visual 7-day calorie trend bar chart, active-day macro averages, and personalized nutrient balance recommendations.
 
 ## Quick Start in Android Studio
-1. Extract `NutriTrackAI.zip`.
-2. Open **Android Studio** and select **Open**, then choose the extracted `NutriTrackAI` folder.
+1. Clone repository.
+2. Open **Android Studio** and select **Open**, then choose the project `NutriTrackAI` folder.
 3. Wait for Android Studio to sync Gradle and download dependencies.
 4. *(Optional)* Copy `local.properties.example` to `local.properties` and add `GEMINI_API_KEY=your_key_here`, **OR** simply set your Gemini API key directly inside the app's **Settings (gear icon)** dialog at runtime.
-5. Connect your Android phone (with USB Debugging enabled) and click **Run ('app')**.
+5. Connect your Android phone (with USB Debugging enabled) and click **Run ('app')** or build an APK from Build -> Generate App Bundle APK 
