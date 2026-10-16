@@ -5,6 +5,17 @@ import java.time.LocalDate
 import java.util.UUID
 
 @Serializable
+data class MealComponent(
+    val name: String,
+    val quantityDescription: String,
+    val calories: Int,
+    val proteinGrams: Float,
+    val carbsGrams: Float,
+    val fatGrams: Float,
+    val fiberGrams: Float = 0f
+)
+
+@Serializable
 data class MealEntry(
     val id: String = UUID.randomUUID().toString(),
     val dateIso: String = LocalDate.now().toString(),

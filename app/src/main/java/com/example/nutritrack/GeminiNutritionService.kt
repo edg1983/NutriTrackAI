@@ -21,7 +21,8 @@ data class AiMealEstimate(
     val carbsGrams: Float,
     val fatGrams: Float,
     val fiberGrams: Float,
-    val healthTip: String
+    val healthTip: String,
+    val components: List<MealComponent> = emptyList()
 )
 
 class GeminiNutritionService {
@@ -56,11 +57,22 @@ class GeminiNutritionService {
               "carbsGrams": 42.0,
               "fatGrams": 16.0,
               "fiberGrams": 6.5,
-              "healthTip": "One concise sentence on how to make this specific meal healthier or better balanced."
+              "healthTip": "One concise sentence on how to make this specific meal healthier or better balanced.",
+              "components": [
+                {
+                  "name": "Component name (e.g. Grilled Chicken)",
+                  "quantityDescription": "Quantity (e.g. 200g)",
+                  "calories": 330,
+                  "proteinGrams": 40.0,
+                  "carbsGrams": 0.0,
+                  "fatGrams": 8.0,
+                  "fiberGrams": 0.0
+                }
+              ]
             }
         """.trimIndent()
 
-        callGeminiWithFallback(apiKey = apiKey, prompt = prompt, bitmap = null)
+        callGeminiAndParse<AiMealEstimate>(apiKey = apiKey, prompt = prompt, bitmap = null)
     }
 
     suspend fun analyzePhotoMeal(
@@ -69,7 +81,7 @@ class GeminiNutritionService {
         optionalHint: String
     ): Result<AiMealEstimate> = withContext(Dispatchers.IO) {
         val prompt = """
-            Look at this meal photo. Identify the dish, estimate the visible portion size in grams and portions, list the visible and likely ingredients, and calculate the macronutrients.
+            Look at this meal photo. Identify the dish, estimate the visible portion size in grams and portions, break down the plate into individual detected components (e.g., 'Grilled Chicken', 'Stewed Carrots', 'Steamed Rice'), list ingredients, and calculate macronutrients for each component and the overall meal.
             ${if (optionalHint.isNotBlank()) "User note: $optionalHint" else ""}
             
             Respond ONLY with a valid JSON object matching this exact schema:
@@ -82,19 +94,63 @@ class GeminiNutritionService {
               "carbsGrams": 48.0,
               "fatGrams": 21.0,
               "fiberGrams": 5.0,
-              "healthTip": "One concise sentence on the nutritional balance of this plate and how to improve it."
+              "healthTip": "One concise sentence on the nutritional balance of this plate and how to improve it.",
+              "components": [
+                {
+                  "name": "Component name (e.g. Grilled Chicken)",
+                  "quantityDescription": "Portion (e.g. 200g)",
+                  "calories": 330,
+                  "proteinGrams": 40.0,
+                  "carbsGrams": 0.0,
+                  "fatGrams": 8.0,
+                  "fiberGrams": 0.0
+                },
+                {
+                  "name": "Component name (e.g. Stewed Carrots)",
+                  "quantityDescription": "Portion (e.g. 120g)",
+                  "calories": 90,
+                  "proteinGrams": 1.2,
+                  "carbsGrams": 14.0,
+                  "fatGrams": 3.0,
+                  "fiberGrams": 3.5
+                }
+              ]
             }
         """.trimIndent()
 
-        callGeminiWithFallback(apiKey = apiKey, prompt = prompt, bitmap = bitmap)
+        callGeminiAndParse<AiMealEstimate>(apiKey = apiKey, prompt = prompt, bitmap = bitmap)
     }
 
-    private fun callGeminiWithFallback(
+    suspend fun analyzeComponentText(
+        apiKey: String,
+        componentName: String,
+        descriptionInput: String
+    ): Result<MealComponent> = withContext(Dispatchers.IO) {
+        val prompt = """
+            Analyze the following individual food item/component and its updated description to estimate its nutritional values accurately.
+            Component Item: "$componentName"
+            User Adjustment / Description: "$descriptionInput"
+            
+            Respond ONLY with a valid JSON object matching this exact schema:
+            {
+              "name": "Concise component title",
+              "quantityDescription": "Quantity description in grams or portions (e.g., '180g')",
+              "calories": 250,
+              "proteinGrams": 22.0,
+              "carbsGrams": 15.0,
+              "fatGrams": 8.0,
+              "fiberGrams": 3.0
+            }
+        """.trimIndent()
+
+        callGeminiAndParse<MealComponent>(apiKey = apiKey, prompt = prompt, bitmap = null)
+    }
+
+    private inline fun <reified T> callGeminiAndParse(
         apiKey: String,
         prompt: String,
         bitmap: Bitmap?
-    ): Result<AiMealEstimate> {
-        // Strip any accidental whitespace, newlines, or quotes from mobile copy-paste
+    ): Result<T> {
         val resolvedKey = apiKey
             .ifBlank { BuildConfig.GEMINI_API_KEY }
             .replace("\\s+".toRegex(), "")
@@ -109,18 +165,22 @@ class GeminiNutritionService {
         var lastError: Throwable = IllegalStateException("No models attempted.")
 
         for (modelName in candidateModels) {
-            val attempt = executeSingleModelCall(resolvedKey, modelName, prompt, bitmap)
+            val attempt = executeSingleModelCallRaw(resolvedKey, modelName, prompt, bitmap)
             if (attempt.isSuccess) {
-                return attempt
+                val rawJson = attempt.getOrThrow()
+                return try {
+                    val parsed = json.decodeFromString<T>(rawJson)
+                    Result.success(parsed)
+                } catch (e: Exception) {
+                    Result.failure(e)
+                }
             }
             val ex = attempt.exceptionOrNull()
             if (ex != null) {
                 lastError = ex
-                // If the error is 404 (Model Not Found on this project tier), try the next model
                 if (ex.message?.contains("(404)") == true) {
                     continue
                 } else {
-                    // For non-404 errors (e.g. 400 Invalid Key, 403 Permission, 429 Quota), return immediately
                     return Result.failure(ex)
                 }
             }
@@ -129,12 +189,12 @@ class GeminiNutritionService {
         return Result.failure(lastError)
     }
 
-    private fun executeSingleModelCall(
+    private fun executeSingleModelCallRaw(
         cleanKey: String,
         modelName: String,
         prompt: String,
         bitmap: Bitmap?
-    ): Result<AiMealEstimate> {
+    ): Result<String> {
         return try {
             val endpoint = URL("https://generativelanguage.googleapis.com/v1beta/models/$modelName:generateContent")
             val connection = (endpoint.openConnection() as HttpURLConnection).apply {
@@ -199,7 +259,6 @@ class GeminiNutritionService {
                 ?.jsonArray
                 ?: throw IllegalStateException("Empty response from Gemini model ($modelName).")
 
-            // Filter out thinking parts if the model includes thought blocks
             val candidateText = candidateParts
                 .mapNotNull { it.jsonObject }
                 .firstOrNull { it["thought"]?.jsonPrimitive?.booleanOrNull != true && it["text"] != null }
@@ -213,8 +272,7 @@ class GeminiNutritionService {
                 .removeSuffix("```")
                 .trim()
 
-            val parsed = json.decodeFromString<AiMealEstimate>(cleanedJson)
-            Result.success(parsed)
+            Result.success(cleanedJson)
         } catch (e: Exception) {
             Result.failure(e)
         }

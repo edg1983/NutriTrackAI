@@ -189,9 +189,53 @@ fun NutriTrackApp(
         }
     }
 
+    // Activity result launchers for JSON Backup & Restore
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            try {
+                val backupJson = repository.exportBackupJson(appState)
+                context.contentResolver.openOutputStream(uri)?.use { stream ->
+                    stream.write(backupJson.toByteArray(Charsets.UTF_8))
+                }
+                Toast.makeText(context, "Backup exported successfully!", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Toast.makeText(context, "Export failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                val jsonText = context.contentResolver.openInputStream(uri)?.use { stream ->
+                    stream.bufferedReader(Charsets.UTF_8).readText()
+                } ?: ""
+                val result = repository.importBackupJson(jsonText)
+                result.onSuccess { restoredState ->
+                    updateState { restoredState }
+                    Toast.makeText(
+                        context,
+                        "Restored ${restoredState.meals.size} meals and ${restoredState.customBarcodes.size} custom barcodes!",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }.onFailure { err ->
+                    Toast.makeText(context, "Invalid backup JSON file: ${err.localizedMessage}", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(context, "Import failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     pendingReviewMeal?.let { draft ->
         ReviewAndAdjustDialog(
             initialEstimate = draft,
+            apiKey = appState.customApiKey,
+            geminiService = geminiService,
             onDismiss = { pendingReviewMeal = null },
             onConfirmSave = { finalEntry ->
                 updateState { it.copy(meals = listOf(finalEntry) + it.meals) }
@@ -215,6 +259,12 @@ fun NutriTrackApp(
                     )
                 }
                 showGoalSettingsDialog = false
+            },
+            onExportBackup = {
+                exportLauncher.launch("NutriTrack_Backup_${LocalDate.now()}.json")
+            },
+            onImportBackup = {
+                importLauncher.launch(arrayOf("application/json", "*/*"))
             }
         )
     }
@@ -982,17 +1032,80 @@ fun LogMealScreen(
 @Composable
 fun ReviewAndAdjustDialog(
     initialEstimate: AiMealEstimate,
+    apiKey: String,
+    geminiService: GeminiNutritionService,
     onDismiss: () -> Unit,
     onConfirmSave: (MealEntry) -> Unit
 ) {
+    val scope = rememberCoroutineScope()
+
     var name by remember { mutableStateOf(initialEstimate.mealName) }
-    var quantity by remember { mutableStateOf(initialEstimate.estimatedQuantity) }
+    var quantityText by remember { mutableStateOf(initialEstimate.estimatedQuantity) }
     var ingredientsText by remember { mutableStateOf(initialEstimate.ingredients.joinToString(", ")) }
-    var calories by remember { mutableStateOf(initialEstimate.calories.toString()) }
-    var protein by remember { mutableStateOf(initialEstimate.proteinGrams.toString()) }
-    var carbs by remember { mutableStateOf(initialEstimate.carbsGrams.toString()) }
-    var fat by remember { mutableStateOf(initialEstimate.fatGrams.toString()) }
-    var fiber by remember { mutableStateOf(initialEstimate.fiberGrams.toString()) }
+
+    val baseCalories = remember(initialEstimate) { initialEstimate.calories }
+    val baseProtein = remember(initialEstimate) { initialEstimate.proteinGrams }
+    val baseCarbs = remember(initialEstimate) { initialEstimate.carbsGrams }
+    val baseFat = remember(initialEstimate) { initialEstimate.fatGrams }
+    val baseFiber = remember(initialEstimate) { initialEstimate.fiberGrams }
+
+    var portionMultiplier by remember { mutableFloatStateOf(1.0f) }
+    var componentsList by remember { mutableStateOf(initialEstimate.components) }
+
+    var caloriesStr by remember { mutableStateOf(initialEstimate.calories.toString()) }
+    var proteinStr by remember { mutableStateOf(initialEstimate.proteinGrams.toString()) }
+    var carbsStr by remember { mutableStateOf(initialEstimate.carbsGrams.toString()) }
+    var fatStr by remember { mutableStateOf(initialEstimate.fatGrams.toString()) }
+    var fiberStr by remember { mutableStateOf(initialEstimate.fiberGrams.toString()) }
+
+    var editingComponentIndex by remember { mutableStateOf<Int?>(null) }
+    var componentAdjustPrompt by remember { mutableStateOf("") }
+    var isAnalyzingComponent by remember { mutableStateOf(false) }
+
+    fun applyScale(scale: Float) {
+        portionMultiplier = scale.coerceIn(0.1f, 10.0f)
+
+        if (componentsList.isNotEmpty()) {
+            val scaledComponents = initialEstimate.components.map { comp ->
+                comp.copy(
+                    calories = kotlin.math.round(comp.calories * scale).toInt(),
+                    proteinGrams = kotlin.math.round(comp.proteinGrams * scale * 10f) / 10f,
+                    carbsGrams = kotlin.math.round(comp.carbsGrams * scale * 10f) / 10f,
+                    fatGrams = kotlin.math.round(comp.fatGrams * scale * 10f) / 10f,
+                    fiberGrams = kotlin.math.round(comp.fiberGrams * scale * 10f) / 10f
+                )
+            }
+            componentsList = scaledComponents
+        }
+
+        val scaledCal = kotlin.math.round(baseCalories * scale).toInt()
+        val scaledProt = kotlin.math.round(baseProtein * scale * 10f) / 10f
+        val scaledCarbs = kotlin.math.round(baseCarbs * scale * 10f) / 10f
+        val scaledFat = kotlin.math.round(baseFat * scale * 10f) / 10f
+        val scaledFiber = kotlin.math.round(baseFiber * scale * 10f) / 10f
+
+        caloriesStr = scaledCal.toString()
+        proteinStr = scaledProt.toString()
+        carbsStr = scaledCarbs.toString()
+        fatStr = scaledFat.toString()
+        fiberStr = scaledFiber.toString()
+    }
+
+    fun recalculateFromComponents() {
+        if (componentsList.isNotEmpty()) {
+            val totalCal = componentsList.sumOf { it.calories }
+            val totalProt = kotlin.math.round(componentsList.sumOf { it.proteinGrams.toDouble() } * 10) / 10f
+            val totalCarbs = kotlin.math.round(componentsList.sumOf { it.carbsGrams.toDouble() } * 10) / 10f
+            val totalFat = kotlin.math.round(componentsList.sumOf { it.fatGrams.toDouble() } * 10) / 10f
+            val totalFiber = kotlin.math.round(componentsList.sumOf { it.fiberGrams.toDouble() } * 10) / 10f
+
+            caloriesStr = totalCal.toString()
+            proteinStr = totalProt.toFloat().toString()
+            carbsStr = totalCarbs.toFloat().toString()
+            fatStr = totalFat.toFloat().toString()
+            fiberStr = totalFiber.toFloat().toString()
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1002,64 +1115,155 @@ fun ReviewAndAdjustDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(
-                    "Verify or tweak the detected values before logging:",
-                    style = MaterialTheme.typography.bodySmall
-                )
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
                     label = { Text("Meal Name") },
                     modifier = Modifier.fillMaxWidth()
                 )
-                OutlinedTextField(
-                    value = quantity,
-                    onValueChange = { quantity = it },
-                    label = { Text("Quantity (Grams / Portions)") },
-                    modifier = Modifier.fillMaxWidth()
-                )
+
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            "Adjust Portion Scale:",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f).forEach { scale ->
+                                FilterChip(
+                                    selected = kotlin.math.abs(portionMultiplier - scale) < 0.05f,
+                                    onClick = {
+                                        applyScale(scale)
+                                        quantityText = if (scale == 1.0f) initialEstimate.estimatedQuantity else "${scale}x (${initialEstimate.estimatedQuantity})"
+                                    },
+                                    label = { Text("${scale}x", style = MaterialTheme.typography.labelSmall) }
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedTextField(
+                            value = quantityText,
+                            onValueChange = { quantityText = it },
+                            label = { Text("Quantity Description") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true
+                        )
+                    }
+                }
+
+                if (componentsList.isNotEmpty()) {
+                    Card(
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "Detected Components (${componentsList.size}):",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    "Tap to adjust with AI",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+
+                            componentsList.forEachIndexed { index, comp ->
+                                Card(
+                                    onClick = {
+                                        editingComponentIndex = index
+                                        componentAdjustPrompt = comp.quantityDescription
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(10.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(comp.name, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyMedium)
+                                            Text("${comp.quantityDescription} • ${comp.calories} kcal", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text("P: ${comp.proteinGrams}g | C: ${comp.carbsGrams}g | F: ${comp.fatGrams}g", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        IconButton(onClick = {
+                                            editingComponentIndex = index
+                                            componentAdjustPrompt = comp.quantityDescription
+                                        }) {
+                                            Icon(Icons.Default.AutoAwesome, contentDescription = "Adjust Component", tint = MaterialTheme.colorScheme.primary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = ingredientsText,
                     onValueChange = { ingredientsText = it },
                     label = { Text("Detected Ingredients (comma-separated)") },
                     modifier = Modifier.fillMaxWidth()
                 )
+
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
-                        value = calories,
-                        onValueChange = { calories = it },
+                        value = caloriesStr,
+                        onValueChange = { caloriesStr = it },
                         label = { Text("Calories (kcal)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.weight(1f)
                     )
                     OutlinedTextField(
-                        value = protein,
-                        onValueChange = { protein = it },
+                        value = proteinStr,
+                        onValueChange = { proteinStr = it },
                         label = { Text("Protein (g)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.weight(1f)
                     )
                 }
+
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
-                        value = carbs,
-                        onValueChange = { carbs = it },
+                        value = carbsStr,
+                        onValueChange = { carbsStr = it },
                         label = { Text("Carbs (g)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.weight(1f)
                     )
                     OutlinedTextField(
-                        value = fat,
-                        onValueChange = { fat = it },
+                        value = fatStr,
+                        onValueChange = { fatStr = it },
                         label = { Text("Fat (g)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.weight(1f)
                     )
                     OutlinedTextField(
-                        value = fiber,
-                        onValueChange = { fiber = it },
+                        value = fiberStr,
+                        onValueChange = { fiberStr = it },
                         label = { Text("Fiber (g)") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.weight(1f)
@@ -1072,13 +1276,13 @@ fun ReviewAndAdjustDialog(
                 onClick = {
                     val entry = MealEntry(
                         name = name.ifBlank { "Logged Meal" },
-                        quantityDescription = quantity.ifBlank { "1 portion" },
+                        quantityDescription = quantityText.ifBlank { "1 portion" },
                         ingredients = ingredientsText.split(",").map { it.trim() }.filter { it.isNotEmpty() },
-                        calories = calories.toIntOrNull() ?: 0,
-                        proteinGrams = protein.toFloatOrNull() ?: 0f,
-                        carbsGrams = carbs.toFloatOrNull() ?: 0f,
-                        fatGrams = fat.toFloatOrNull() ?: 0f,
-                        fiberGrams = fiber.toFloatOrNull() ?: 0f,
+                        calories = caloriesStr.toIntOrNull() ?: 0,
+                        proteinGrams = proteinStr.toFloatOrNull() ?: 0f,
+                        carbsGrams = carbsStr.toFloatOrNull() ?: 0f,
+                        fatGrams = fatStr.toFloatOrNull() ?: 0f,
+                        fiberGrams = fiberStr.toFloatOrNull() ?: 0f,
                         aiNotes = initialEstimate.healthTip
                     )
                     onConfirmSave(entry)
@@ -1093,6 +1297,61 @@ fun ReviewAndAdjustDialog(
             }
         }
     )
+
+    editingComponentIndex?.let { index ->
+        val targetComp = componentsList.getOrNull(index) ?: return@let
+        AlertDialog(
+            onDismissRequest = { editingComponentIndex = null },
+            title = { Text("Adjust '${targetComp.name}' with AI", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Describe your adjustment for '${targetComp.name}' (e.g., '180g steamed carrots with butter'):",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = componentAdjustPrompt,
+                        onValueChange = { componentAdjustPrompt = it },
+                        label = { Text("Component description / adjustment") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (componentAdjustPrompt.isBlank()) return@Button
+                        isAnalyzingComponent = true
+                        scope.launch {
+                            val res = geminiService.analyzeComponentText(
+                                apiKey = apiKey,
+                                componentName = targetComp.name,
+                                descriptionInput = componentAdjustPrompt
+                            )
+                            isAnalyzingComponent = false
+                            res.onSuccess { updatedComp ->
+                                val updatedList = componentsList.toMutableList()
+                                updatedList[index] = updatedComp
+                                componentsList = updatedList
+                                recalculateFromComponents()
+                                editingComponentIndex = null
+                            }
+                        }
+                    },
+                    enabled = !isAnalyzingComponent && componentAdjustPrompt.isNotBlank()
+                ) {
+                    Icon(Icons.Default.AutoAwesome, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(if (isAnalyzingComponent) "Re-analyzing..." else "AI Re-Analyze")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingComponentIndex = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -1278,7 +1537,9 @@ fun WeeklyReportScreen(appState: AppStateData) {
 fun GoalAndApiSettingsDialog(
     currentState: AppStateData,
     onDismiss: () -> Unit,
-    onSave: (Int, Int, String) -> Unit
+    onSave: (Int, Int, String) -> Unit,
+    onExportBackup: () -> Unit,
+    onImportBackup: () -> Unit
 ) {
     var calGoal by remember { mutableStateOf(currentState.dailyCalorieGoal.toString()) }
     var waterGoal by remember { mutableStateOf(currentState.dailyWaterGoalMl.toString()) }
@@ -1286,9 +1547,15 @@ fun GoalAndApiSettingsDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Goals & Gemini API Settings", fontWeight = FontWeight.Bold) },
+        title = { Text("Settings & Backup", fontWeight = FontWeight.Bold) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("App Goals", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 OutlinedTextField(
                     value = calGoal,
                     onValueChange = { calGoal = it },
@@ -1306,10 +1573,38 @@ fun GoalAndApiSettingsDialog(
                 OutlinedTextField(
                     value = apiKey,
                     onValueChange = { apiKey = it },
-                    label = { Text("Gemini API Key (if not in local.properties)") },
+                    label = { Text("Gemini API Key (optional)") },
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                HorizontalDivider()
+
+                Text("Data Backup & Restore", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                Text(
+                    "Currently saved: ${currentState.meals.size} meals, ${currentState.customBarcodes.size} custom barcodes.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = onExportBackup,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.UploadFile, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Backup")
+                    }
+                    OutlinedButton(
+                        onClick = onImportBackup,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.FileDownload, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Restore")
+                    }
+                }
             }
         },
         confirmButton = {
