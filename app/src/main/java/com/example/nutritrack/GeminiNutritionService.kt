@@ -25,6 +25,20 @@ data class AiMealEstimate(
     val components: List<MealComponent> = emptyList()
 )
 
+@Serializable
+data class RecipeSuggestion(
+    val recipeTitle: String,
+    val prepAndCookTime: String,
+    val summaryAndRationale: String,
+    val ingredientsList: List<String>,
+    val instructions: List<String>,
+    val calories: Int,
+    val proteinGrams: Float,
+    val carbsGrams: Float,
+    val fatGrams: Float,
+    val fiberGrams: Float
+)
+
 class GeminiNutritionService {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -144,6 +158,57 @@ class GeminiNutritionService {
         """.trimIndent()
 
         callGeminiAndParse<MealComponent>(apiKey = apiKey, prompt = prompt, bitmap = null)
+    }
+
+    suspend fun suggestMealRecipe(
+        apiKey: String,
+        consumedCalories: Int,
+        targetCalories: Int,
+        consumedProtein: Float,
+        consumedCarbs: Float,
+        consumedFat: Float,
+        consumedFiber: Float
+    ): Result<RecipeSuggestion> = withContext(Dispatchers.IO) {
+        val remainingCal = (targetCalories - consumedCalories).coerceAtLeast(100)
+
+        val prompt = """
+            You are an expert nutritionist and chef. Recommend ONE healthy, delicious, easy-to-cook meal recipe tailored specifically to complement the user's daily intake so far today.
+            
+            Current Intake Today:
+            - Calories Consumed: $consumedCalories kcal (Daily Target: $targetCalories kcal, Remaining: $remainingCal kcal)
+            - Protein Consumed: ${consumedProtein.toInt()}g
+            - Carbs Consumed: ${consumedCarbs.toInt()}g
+            - Fat Consumed: ${consumedFat.toInt()}g
+            - Fiber Consumed: ${consumedFiber.toInt()}g
+            
+            Provide a complete recipe that fills the remaining calorie and macronutrient gaps appropriately.
+            
+            Respond ONLY with a valid JSON object matching this exact schema:
+            {
+              "recipeTitle": "Concise appetizing recipe title",
+              "prepAndCookTime": "e.g. 20 mins (10 min prep, 10 min cook)",
+              "summaryAndRationale": "Why this recipe is ideal to complement today's intake (e.g., 'Provides 35g of protein and 8g of fiber to meet your daily target without exceeding your remaining $remainingCal kcal budget.')",
+              "ingredientsList": [
+                "200g chicken breast",
+                "150g broccoli florets",
+                "1 tbsp olive oil",
+                "Seasonings to taste"
+              ],
+              "instructions": [
+                "Cut chicken into bite-sized pieces and season.",
+                "Heat olive oil in a skillet over medium heat.",
+                "Sauté chicken for 6-8 minutes until golden.",
+                "Steam broccoli and serve together."
+              ],
+              "calories": 420,
+              "proteinGrams": 38.0,
+              "carbsGrams": 15.0,
+              "fatGrams": 12.0,
+              "fiberGrams": 6.0
+            }
+        """.trimIndent()
+
+        callGeminiAndParse<RecipeSuggestion>(apiKey = apiKey, prompt = prompt, bitmap = null)
     }
 
     private inline fun <reified T> callGeminiAndParse(

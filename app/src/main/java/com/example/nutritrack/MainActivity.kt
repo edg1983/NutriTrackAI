@@ -83,6 +83,7 @@ fun NutriTrackApp(
     openFoodFactsService: OpenFoodFactsService
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     var appState by remember { mutableStateOf(repository.loadState()) }
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -90,6 +91,10 @@ fun NutriTrackApp(
 
     // Draft Meal for "Review & Adjust" Modal
     var pendingReviewMeal by remember { mutableStateOf<AiMealEstimate?>(null) }
+
+    // State for "Suggest Meal Recipe"
+    var isGeneratingRecipe by remember { mutableStateOf(false) }
+    var suggestedRecipe by remember { mutableStateOf<RecipeSuggestion?>(null) }
 
     fun updateState(transform: (AppStateData) -> AppStateData) {
         val updated = transform(appState)
@@ -161,7 +166,29 @@ fun NutriTrackApp(
                             it.copy(meals = it.meals.filterNot { m -> m.id == mealId })
                         }
                     },
-                    onOpenGoalDialog = { showGoalSettingsDialog = true }
+                    onOpenGoalDialog = { showGoalSettingsDialog = true },
+                    onSuggestRecipeClick = {
+                        val todayKey = LocalDate.now()
+                        val summary = NutritionAnalyzer.summarizeDay(todayKey, appState.meals, appState.waterLogs)
+                        isGeneratingRecipe = true
+                        scope.launch {
+                            val result = geminiService.suggestMealRecipe(
+                                apiKey = appState.customApiKey,
+                                consumedCalories = summary.calories,
+                                targetCalories = appState.dailyCalorieGoal,
+                                consumedProtein = summary.proteinG,
+                                consumedCarbs = summary.carbsG,
+                                consumedFat = summary.fatG,
+                                consumedFiber = summary.fiberG
+                            )
+                            isGeneratingRecipe = false
+                            result.onSuccess { recipe ->
+                                suggestedRecipe = recipe
+                            }.onFailure { err ->
+                                Toast.makeText(context, err.localizedMessage ?: "Recipe suggestion failed.", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
                 )
 
                 1 -> LogMealScreen(
@@ -187,6 +214,35 @@ fun NutriTrackApp(
                 2 -> WeeklyReportScreen(appState = appState)
             }
         }
+    }
+
+    if (isGeneratingRecipe) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("AI Chef at Work", fontWeight = FontWeight.Bold) },
+            text = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    modifier = Modifier.padding(8.dp)
+                ) {
+                    CircularProgressIndicator()
+                    Text("Analyzing today's intake and crafting a personalized recipe...")
+                }
+            },
+            confirmButton = {}
+        )
+    }
+
+    suggestedRecipe?.let { recipe ->
+        RecipeSuggestionDialog(
+            recipe = recipe,
+            onDismiss = { suggestedRecipe = null },
+            onLogRecipe = { estimate ->
+                suggestedRecipe = null
+                pendingReviewMeal = estimate
+            }
+        )
     }
 
     // Activity result launchers for JSON Backup & Restore
@@ -275,7 +331,8 @@ fun TodayDashboardScreen(
     appState: AppStateData,
     onAddWater: (Int) -> Unit,
     onDeleteMeal: (String) -> Unit,
-    onOpenGoalDialog: () -> Unit
+    onOpenGoalDialog: () -> Unit,
+    onSuggestRecipeClick: () -> Unit
 ) {
     val today = LocalDate.now()
     val summary = remember(appState) {
@@ -484,6 +541,54 @@ fun TodayDashboardScreen(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                    }
+                }
+            }
+        }
+
+        item {
+            Card(
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            Icons.Default.Restaurant,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            "Need Inspiration for your Next Meal?",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        "Get a personalized AI recipe tailored to fill your remaining calories and macro targets today.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = onSuggestRecipeClick,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.AutoAwesome, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Suggest Meal Recipe")
                     }
                 }
             }
@@ -1782,6 +1887,123 @@ fun CreateCustomBarcodeDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+fun RecipeSuggestionDialog(
+    recipe: RecipeSuggestion,
+    onDismiss: () -> Unit,
+    onLogRecipe: (AiMealEstimate) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column {
+                Text(recipe.recipeTitle, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Timer,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        recipe.prepAndCookTime,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f))
+                ) {
+                    Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.Top) {
+                        Icon(
+                            Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            recipe.summaryAndRationale,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    MacroPill("Cal", "${recipe.calories}", Color(0xFF1B6B50))
+                    MacroPill("Protein", "${recipe.proteinGrams.toInt()}g", Color(0xFF1E88E5))
+                    MacroPill("Carbs", "${recipe.carbsGrams.toInt()}g", Color(0xFFFB8C00))
+                    MacroPill("Fat", "${recipe.fatGrams.toInt()}g", Color(0xFFE53935))
+                    MacroPill("Fiber", "${recipe.fiberGrams.toInt()}g", Color(0xFF43A047))
+                }
+
+                Text("Ingredients:", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    recipe.ingredientsList.forEach { item ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("• ", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                            Text(item, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+
+                Text("Instructions:", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    recipe.instructions.forEachIndexed { idx, step ->
+                        Row(verticalAlignment = Alignment.Top) {
+                            Text("${idx + 1}. ", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                            Text(step, style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val estimate = AiMealEstimate(
+                        mealName = recipe.recipeTitle,
+                        estimatedQuantity = "1 serving (${recipe.prepAndCookTime})",
+                        ingredients = recipe.ingredientsList,
+                        calories = recipe.calories,
+                        proteinGrams = recipe.proteinGrams,
+                        carbsGrams = recipe.carbsGrams,
+                        fatGrams = recipe.fatGrams,
+                        fiberGrams = recipe.fiberGrams,
+                        healthTip = recipe.summaryAndRationale
+                    )
+                    onLogRecipe(estimate)
+                }
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Log This Meal")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Close")
             }
         }
     )
